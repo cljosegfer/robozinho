@@ -287,11 +287,16 @@ class GCValue(nn.Module):
         mlp_module = MLP
         if self.ensemble:
             mlp_module = ensemblize(mlp_module, 2)
-        value_net = mlp_module((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
+        # value_net = mlp_module((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
+        # self.value_net = value_net
 
-        self.value_net = value_net
+        # SPLIT into Body and Head
+        # Body: All hidden dims
+        self.body = mlp_module(self.hidden_dims, activate_final=True, layer_norm=self.layer_norm)
+        # Head: Project to 1 scalar
+        self.head = ensemblize(nn.Dense, 2)(1, kernel_init=default_init()) if self.ensemble else nn.Dense(1, kernel_init=default_init())
 
-    def __call__(self, observations, goals=None, actions=None):
+    def __call__(self, observations, goals=None, actions=None, return_features=False):
         """Return the value/critic function.
 
         Args:
@@ -309,8 +314,15 @@ class GCValue(nn.Module):
             inputs.append(actions)
         inputs = jnp.concatenate(inputs, axis=-1)
 
-        v = self.value_net(inputs).squeeze(-1)
+        # v = self.value_net(inputs).squeeze(-1)
+        # Pass through Body
+        features = self.body(inputs)
+        
+        # Pass through Head
+        v = self.head(features).squeeze(-1)
 
+        if return_features:
+            return v, features
         return v
 
 

@@ -27,12 +27,14 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         weight = jnp.where(adv >= 0, expectile, (1 - expectile))
         return weight * (diff**2)
 
-    def value_loss(self, batch, grad_params):
+    def value_loss(self, batch, grad_params, weights = 1.0):
         """Compute the IQL value loss."""
         q1, q2 = self.network.select('target_critic')(batch['observations'], batch['value_goals'], batch['actions'])
         q = jnp.minimum(q1, q2)
         v = self.network.select('value')(batch['observations'], batch['value_goals'], params=grad_params)
-        value_loss = self.expectile_loss(q - v, q - v, self.config['expectile']).mean()
+        # Apply weights to the element-wise loss before averaging
+        loss = self.expectile_loss(q - v, q - v, self.config['expectile']).mean()
+        value_loss = (loss * weights).mean()
 
         return value_loss, {
             'value_loss': value_loss,
@@ -41,7 +43,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
             'v_min': v.min(),
         }
 
-    def critic_loss(self, batch, grad_params):
+    def critic_loss(self, batch, grad_params, weights = 1.0):
         """Compute the IQL critic loss."""
         next_v = self.network.select('value')(batch['next_observations'], batch['value_goals'])
         q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_v
@@ -49,7 +51,9 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         q1, q2 = self.network.select('critic')(
             batch['observations'], batch['value_goals'], batch['actions'], params=grad_params
         )
-        critic_loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
+        # Apply weights
+        loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
+        critic_loss = (loss * weights).mean()
 
         return critic_loss, {
             'critic_loss': critic_loss,
@@ -58,7 +62,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
             'q_min': q.min(),
         }
 
-    def actor_loss(self, batch, grad_params, rng=None):
+    def actor_loss(self, batch, grad_params, rng=None, weights=1.0):
         """Compute the actor loss (AWR or DDPG+BC)."""
         if self.config['actor_loss'] == 'awr':
             # AWR loss.
@@ -105,7 +109,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
             q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
             log_prob = dist.log_prob(batch['actions'])
 
-            bc_loss = -(self.config['alpha'] * log_prob).mean()
+            bc_loss = -(self.config['alpha'] * log_prob * weights).mean()
 
             actor_loss = q_loss + bc_loss
 
@@ -128,16 +132,72 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         info = {}
         rng = rng if rng is not None else self.rng
 
-        value_loss, value_info = self.value_loss(batch, grad_params)
+        # --- TEMPORAL EFFICIENCY CALCULATION
+        # 1. Use Target Value Network (stable ruler)
+        # 2. Use the task goals from the batch (context)
+        # 3. We use return_features=True to get the latent embeddings
+        
+        # Embed s_t (Current)
+        _, h_curr = self.network.select('target_value')(
+            batch['observations'], batch['value_goals'], return_features=True
+        )
+        
+        # Embed s_{t+1} (Next - Actual Step)
+        _, h_next = self.network.select('target_value')(
+            batch['next_observations'], batch['value_goals'], return_features=True
+        )
+        
+        # Embed s_{t+k} (Future - Optimal Step) -> From your Step 1 Dataset modification
+        _, h_future = self.network.select('target_value')(
+            batch['te_observations'], batch['value_goals'], return_features=True
+        )
+
+        # Handle Ensemble: h will be [2, batch, dim] if ensemble=True
+        # We average the features across the ensemble to get a stable representation
+        if h_curr.ndim == 3: 
+            h_curr = h_curr.mean(axis=0)
+            h_next = h_next.mean(axis=0)
+            h_future = h_future.mean(axis=0)
+
+        # Calculate Vectors
+        vec_actual = h_next - h_curr
+        vec_optimal = h_future - h_curr
+
+        # Cosine Similarity
+        # Add epsilon to prevent divide by zero
+        # norm_actual = jnp.linalg.norm(vec_actual, axis=-1) + 1e-6
+        # norm_optimal = jnp.linalg.norm(vec_optimal, axis=-1) + 1e-6
+        denom = (jnp.linalg.norm(vec_actual, axis=-1) * jnp.linalg.norm(vec_optimal, axis=-1)) + 1e-6
+        
+        # Dot product
+        # dot_prod = jnp.sum(vec_actual * vec_optimal, axis=-1)
+        
+        # TE Score (-1 to 1)
+        # te_score = dot_prod / (norm_actual * norm_optimal)
+        te_score = jnp.sum(vec_actual * vec_optimal, axis=-1) / denom
+
+        # 4. Compute Weights (ReLU filter)
+        # If cos_sim > 0, keep it. If < 0 (moving away from future), zero it out.
+        # You can also scale this: weights = jax.nn.relu(te_score) ** 2
+        te_weights = jax.nn.relu(te_score)
+        # Stop gradients just in case (though target network parameters are frozen anyway)
+        te_weights = jax.lax.stop_gradient(te_weights)
+        
+        # Log the TE score
+        info['te_score_mean'] = te_score.mean()
+        info['te/weight_mean'] = te_weights.mean()
+        info['te/weight_min'] = te_weights.min()
+
+        value_loss, value_info = self.value_loss(batch, grad_params, weights=te_weights)
         for k, v in value_info.items():
             info[f'value/{k}'] = v
 
-        critic_loss, critic_info = self.critic_loss(batch, grad_params)
+        critic_loss, critic_info = self.critic_loss(batch, grad_params, weights=te_weights)
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
         rng, actor_rng = jax.random.split(rng)
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng, weights=te_weights)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
@@ -163,6 +223,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
+        self.target_update(new_network, 'value')
 
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -258,6 +319,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
             critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
             actor=(actor_def, (ex_observations, ex_goals)),
+            target_value=(copy.deepcopy(value_def), (ex_observations, ex_goals)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -269,6 +331,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
 
         params = network_params
         params['modules_target_critic'] = params['modules_critic']
+        params['modules_target_value'] = params['modules_value']
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
@@ -304,6 +367,8 @@ def get_config():
             gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            te_step=25,  # The 'k' for Temporal Efficiency lookahead
+            te_weight=1.0, # Strength of the TE filter
         )
     )
     return config

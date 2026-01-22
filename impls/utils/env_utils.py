@@ -87,7 +87,7 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
         A tuple of the environment, training dataset, and validation dataset.
     """
     # Use compact dataset to save memory.
-    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name, compact_dataset=True)
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name, compact_dataset=True, dataset_dir="/scratch/josefernandes/ogbench")
     train_dataset = Dataset.create(**train_dataset)
     val_dataset = Dataset.create(**val_dataset)
 

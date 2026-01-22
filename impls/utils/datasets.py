@@ -195,6 +195,10 @@ class GCDataset:
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
 
+        # Default Temporal Efficiency lookahead step (k)
+        # If not in config, default to 5 (a reasonable heuristic for local linearity)
+        self.te_step = self.config.get('te_step', 5) 
+
         if self.config['frame_stack'] is not None:
             # Only support compact (observation-only) datasets.
             assert 'next_observations' not in self.dataset
@@ -242,6 +246,18 @@ class GCDataset:
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # 1. Find the end of the current trajectory for each index
+        # self.terminal_locs contains indices where terminals=1
+        # np.searchsorted finds which trajectory segment the index belongs to
+        traj_end_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        
+        # 2. Calculate t + k
+        # We want state at t + k, but we must not go past the end of the trajectory
+        te_idxs = np.minimum(idxs + self.te_step, traj_end_idxs)
+        
+        # 3. Add to batch
+        batch['te_observations'] = self.get_observations(te_idxs)
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
