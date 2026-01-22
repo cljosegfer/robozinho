@@ -185,10 +185,15 @@ class GCIQLAgent(flax.struct.PyTreeNode):
 
         # --- ANNEALING LOGIC ---
         # Config: Warmup over 500k steps (50% of training)
-        warmup_steps = 500000.0
+        # warmup_steps = 500000.0
+        # --- DELAYED ANNEALING LOGIC ---
+        start_ramp_step = 500000.0  # Train normally until here
+        end_ramp_step = 1000000.0    # Fully apply filter by here
         
         # Alpha: 0.0 at start, 1.0 at warmup_steps
-        alpha = jnp.clip(step / warmup_steps, 0.0, 1.0)
+        # alpha = jnp.clip(step / warmup_steps, 0.0, 1.0)
+        ramp_progress = (step - start_ramp_step) / (end_ramp_step - start_ramp_step)
+        alpha = jnp.clip(ramp_progress, 0.0, 1.0)
         
         # Interpolate: 
         # If alpha=0 (start): weight is 1.0 (Standard GCIQL)
