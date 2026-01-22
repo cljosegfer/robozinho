@@ -197,7 +197,7 @@ class GCDataset:
 
         # Default Temporal Efficiency lookahead step (k)
         # If not in config, default to 5 (a reasonable heuristic for local linearity)
-        self.te_step = self.config.get('te_step', 5) 
+        self.te_step = self.config.get('te_step', 10)
 
         if self.config['frame_stack'] is not None:
             # Only support compact (observation-only) datasets.

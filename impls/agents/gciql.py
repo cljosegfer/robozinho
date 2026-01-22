@@ -127,7 +127,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
             raise ValueError(f'Unsupported actor loss: {self.config["actor_loss"]}')
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, step=0):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
@@ -182,11 +182,24 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         te_weights = jax.nn.relu(te_score)
         # Stop gradients just in case (though target network parameters are frozen anyway)
         te_weights = jax.lax.stop_gradient(te_weights)
+
+        # --- ANNEALING LOGIC ---
+        # Config: Warmup over 500k steps (50% of training)
+        warmup_steps = 500000.0
+        
+        # Alpha: 0.0 at start, 1.0 at warmup_steps
+        alpha = jnp.clip(step / warmup_steps, 0.0, 1.0)
+        
+        # Interpolate: 
+        # If alpha=0 (start): weight is 1.0 (Standard GCIQL)
+        # If alpha=1 (end): weight is raw_weight (Filtered)
+        te_weights = (1.0 - alpha) * 1.0 + alpha * te_weights
         
         # Log the TE score
-        info['te_score_mean'] = te_score.mean()
+        info['te/score_mean'] = te_score.mean()
         info['te/weight_mean'] = te_weights.mean()
         info['te/weight_min'] = te_weights.min()
+        info['te/annealing_alpha'] = alpha
 
         value_loss, value_info = self.value_loss(batch, grad_params, weights=te_weights)
         for k, v in value_info.items():
@@ -218,8 +231,11 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
+        # Capture current step from TrainState
+        current_step = self.network.step
+
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, step=current_step)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
@@ -367,7 +383,7 @@ def get_config():
             gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
-            te_step=25,  # The 'k' for Temporal Efficiency lookahead
+            te_step=10,  # The 'k' for Temporal Efficiency lookahead
             te_weight=1.0, # Strength of the TE filter
         )
     )
